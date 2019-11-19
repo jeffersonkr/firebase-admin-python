@@ -14,6 +14,7 @@
 
 """Test cases for the firebase_admin._user_mgt module."""
 
+import base64
 import json
 import time
 
@@ -21,6 +22,7 @@ import pytest
 
 import firebase_admin
 from firebase_admin import auth
+from firebase_admin import exceptions
 from firebase_admin import _auth_utils
 from firebase_admin import _user_import
 from firebase_admin import _user_mgt
@@ -151,6 +153,13 @@ class TestUserRecord(object):
         assert user.password_hash == ''
         assert user.password_salt == ''
 
+    def test_redacted_passwords_cleared(self):
+        user = auth.ExportedUserRecord({
+            'localId': 'user',
+            'passwordHash': base64.b64encode(b'REDACTED'),
+        })
+        assert user.password_hash is None
+
     def test_custom_claims(self):
         user = auth.UserRecord({
             'localId' : 'user',
@@ -211,33 +220,89 @@ class TestGetUser(object):
 
     def test_get_user_non_existing(self, user_mgt_app):
         _instrument_user_manager(user_mgt_app, 200, '{"users":[]}')
-        with pytest.raises(auth.AuthError) as excinfo:
+        with pytest.raises(auth.UserNotFoundError) as excinfo:
             auth.get_user('nonexistentuser', user_mgt_app)
-        assert excinfo.value.code == _user_mgt.USER_NOT_FOUND_ERROR
+        error_msg = 'No user record found for the provided user ID: nonexistentuser.'
+        assert excinfo.value.code == exceptions.NOT_FOUND
+        assert str(excinfo.value) == error_msg
+        assert excinfo.value.http_response is not None
+        assert excinfo.value.cause is None
+
+    def test_get_user_by_email_non_existing(self, user_mgt_app):
+        _instrument_user_manager(user_mgt_app, 200, '{"users":[]}')
+        with pytest.raises(auth.UserNotFoundError) as excinfo:
+            auth.get_user_by_email('nonexistent@user', user_mgt_app)
+        error_msg = 'No user record found for the provided email: nonexistent@user.'
+        assert excinfo.value.code == exceptions.NOT_FOUND
+        assert str(excinfo.value) == error_msg
+        assert excinfo.value.http_response is not None
+        assert excinfo.value.cause is None
+
+    def test_get_user_by_phone_non_existing(self, user_mgt_app):
+        _instrument_user_manager(user_mgt_app, 200, '{"users":[]}')
+        with pytest.raises(auth.UserNotFoundError) as excinfo:
+            auth.get_user_by_phone_number('+1234567890', user_mgt_app)
+        error_msg = 'No user record found for the provided phone number: +1234567890.'
+        assert excinfo.value.code == exceptions.NOT_FOUND
+        assert str(excinfo.value) == error_msg
+        assert excinfo.value.http_response is not None
+        assert excinfo.value.cause is None
 
     def test_get_user_http_error(self, user_mgt_app):
-        _instrument_user_manager(user_mgt_app, 500, '{"error":"test"}')
-        with pytest.raises(auth.AuthError) as excinfo:
+        _instrument_user_manager(user_mgt_app, 500, '{"error":{"message": "USER_NOT_FOUND"}}')
+        with pytest.raises(auth.UserNotFoundError) as excinfo:
             auth.get_user('testuser', user_mgt_app)
-        assert excinfo.value.code == _user_mgt.INTERNAL_ERROR
-        assert '{"error":"test"}' in str(excinfo.value)
+        error_msg = 'No user record found for the given identifier (USER_NOT_FOUND).'
+        assert excinfo.value.code == exceptions.NOT_FOUND
+        assert str(excinfo.value) == error_msg
+        assert excinfo.value.http_response is not None
+        assert excinfo.value.cause is not None
+
+    def test_get_user_http_error_unexpected_code(self, user_mgt_app):
+        _instrument_user_manager(user_mgt_app, 500, '{"error":{"message": "UNEXPECTED_CODE"}}')
+        with pytest.raises(exceptions.InternalError) as excinfo:
+            auth.get_user('testuser', user_mgt_app)
+        assert str(excinfo.value) == 'Error while calling Auth service (UNEXPECTED_CODE).'
+        assert excinfo.value.http_response is not None
+        assert excinfo.value.cause is not None
+
+    def test_get_user_http_error_malformed_response(self, user_mgt_app):
+        _instrument_user_manager(user_mgt_app, 500, '{"error": "UNEXPECTED_CODE"}')
+        with pytest.raises(exceptions.InternalError) as excinfo:
+            auth.get_user('testuser', user_mgt_app)
+        assert str(excinfo.value) == 'Unexpected error response: {"error": "UNEXPECTED_CODE"}'
+        assert excinfo.value.http_response is not None
+        assert excinfo.value.cause is not None
 
     def test_get_user_by_email_http_error(self, user_mgt_app):
-        _instrument_user_manager(user_mgt_app, 500, '{"error":"test"}')
-        with pytest.raises(auth.AuthError) as excinfo:
+        _instrument_user_manager(user_mgt_app, 500, '{"error":{"message": "USER_NOT_FOUND"}}')
+        with pytest.raises(auth.UserNotFoundError) as excinfo:
             auth.get_user_by_email('non.existent.user@example.com', user_mgt_app)
-        assert excinfo.value.code == _user_mgt.INTERNAL_ERROR
-        assert '{"error":"test"}' in str(excinfo.value)
+        error_msg = 'No user record found for the given identifier (USER_NOT_FOUND).'
+        assert excinfo.value.code == exceptions.NOT_FOUND
+        assert str(excinfo.value) == error_msg
+        assert excinfo.value.http_response is not None
+        assert excinfo.value.cause is not None
 
     def test_get_user_by_phone_http_error(self, user_mgt_app):
-        _instrument_user_manager(user_mgt_app, 500, '{"error":"test"}')
-        with pytest.raises(auth.AuthError) as excinfo:
+        _instrument_user_manager(user_mgt_app, 500, '{"error":{"message": "USER_NOT_FOUND"}}')
+        with pytest.raises(auth.UserNotFoundError) as excinfo:
             auth.get_user_by_phone_number('+1234567890', user_mgt_app)
-        assert excinfo.value.code == _user_mgt.INTERNAL_ERROR
-        assert '{"error":"test"}' in str(excinfo.value)
+        error_msg = 'No user record found for the given identifier (USER_NOT_FOUND).'
+        assert excinfo.value.code == exceptions.NOT_FOUND
+        assert str(excinfo.value) == error_msg
+        assert excinfo.value.http_response is not None
+        assert excinfo.value.cause is not None
 
 
 class TestCreateUser(object):
+
+    already_exists_errors = {
+        'DUPLICATE_EMAIL': auth.EmailAlreadyExistsError,
+        'DUPLICATE_LOCAL_ID': auth.UidAlreadyExistsError,
+        'EMAIL_EXISTS': auth.EmailAlreadyExistsError,
+        'PHONE_NUMBER_EXISTS': auth.PhoneNumberAlreadyExistsError,
+    }
 
     @pytest.mark.parametrize('arg', INVALID_STRINGS[1:] + ['a'*129])
     def test_invalid_uid(self, user_mgt_app, arg):
@@ -301,11 +366,33 @@ class TestCreateUser(object):
         assert request == {'localId' : 'testuser'}
 
     def test_create_user_error(self, user_mgt_app):
-        _instrument_user_manager(user_mgt_app, 500, '{"error":"test"}')
-        with pytest.raises(auth.AuthError) as excinfo:
+        _instrument_user_manager(user_mgt_app, 500, '{"error": {"message": "UNEXPECTED_CODE"}}')
+        with pytest.raises(exceptions.InternalError) as excinfo:
             auth.create_user(app=user_mgt_app)
-        assert excinfo.value.code == _user_mgt.USER_CREATE_ERROR
-        assert '{"error":"test"}' in str(excinfo.value)
+        assert str(excinfo.value) == 'Error while calling Auth service (UNEXPECTED_CODE).'
+        assert excinfo.value.http_response is not None
+        assert excinfo.value.cause is not None
+
+    @pytest.mark.parametrize('error_code', already_exists_errors.keys())
+    def test_user_already_exists(self, user_mgt_app, error_code):
+        resp = {'error': {'message': error_code}}
+        _instrument_user_manager(user_mgt_app, 500, json.dumps(resp))
+        exc_type = self.already_exists_errors[error_code]
+        with pytest.raises(exc_type) as excinfo:
+            auth.create_user(app=user_mgt_app)
+        assert isinstance(excinfo.value, exceptions.AlreadyExistsError)
+        assert str(excinfo.value) == '{0} ({1}).'.format(exc_type.default_message, error_code)
+        assert excinfo.value.http_response is not None
+        assert excinfo.value.cause is not None
+
+    def test_create_user_unexpected_response(self, user_mgt_app):
+        _instrument_user_manager(user_mgt_app, 200, '{"error": "test"}')
+        with pytest.raises(auth.UnexpectedResponseError) as excinfo:
+            auth.create_user(app=user_mgt_app)
+        assert str(excinfo.value) == 'Failed to create new user.'
+        assert excinfo.value.http_response is not None
+        assert excinfo.value.cause is None
+        assert isinstance(excinfo.value, exceptions.UnknownError)
 
 
 class TestUpdateUser(object):
@@ -387,16 +474,6 @@ class TestUpdateUser(object):
         request = json.loads(recorder[0].body.decode())
         assert request == {'localId' : 'testuser', 'customAttributes' : json.dumps({})}
 
-    def test_update_user_delete_fields_with_none(self, user_mgt_app):
-        user_mgt, recorder = _instrument_user_manager(user_mgt_app, 200, '{"localId":"testuser"}')
-        user_mgt.update_user('testuser', display_name=None, photo_url=None, phone_number=None)
-        request = json.loads(recorder[0].body.decode())
-        assert request == {
-            'localId' : 'testuser',
-            'deleteAttribute' : ['DISPLAY_NAME', 'PHOTO_URL'],
-            'deleteProvider' : ['phone'],
-        }
-
     def test_update_user_delete_fields(self, user_mgt_app):
         user_mgt, recorder = _instrument_user_manager(user_mgt_app, 200, '{"localId":"testuser"}')
         user_mgt.update_user(
@@ -412,11 +489,21 @@ class TestUpdateUser(object):
         }
 
     def test_update_user_error(self, user_mgt_app):
-        _instrument_user_manager(user_mgt_app, 500, '{"error":"test"}')
-        with pytest.raises(auth.AuthError) as excinfo:
+        _instrument_user_manager(user_mgt_app, 500, '{"error": {"message": "UNEXPECTED_CODE"}}')
+        with pytest.raises(exceptions.InternalError) as excinfo:
             auth.update_user('user', app=user_mgt_app)
-        assert excinfo.value.code == _user_mgt.USER_UPDATE_ERROR
-        assert '{"error":"test"}' in str(excinfo.value)
+        assert str(excinfo.value) == 'Error while calling Auth service (UNEXPECTED_CODE).'
+        assert excinfo.value.http_response is not None
+        assert excinfo.value.cause is not None
+
+    def test_update_user_unexpected_response(self, user_mgt_app):
+        _instrument_user_manager(user_mgt_app, 200, '{"error": "test"}')
+        with pytest.raises(auth.UnexpectedResponseError) as excinfo:
+            auth.update_user('user', app=user_mgt_app)
+        assert str(excinfo.value) == 'Failed to update user: user.'
+        assert excinfo.value.http_response is not None
+        assert excinfo.value.cause is None
+        assert isinstance(excinfo.value, exceptions.UnknownError)
 
     @pytest.mark.parametrize('arg', [1, 1.0])
     def test_update_user_valid_since(self, user_mgt_app, arg):
@@ -473,18 +560,20 @@ class TestSetCustomUserClaims(object):
         request = json.loads(recorder[0].body.decode())
         assert request == {'localId' : 'testuser', 'customAttributes' : claims}
 
-    def test_set_custom_user_claims_none(self, user_mgt_app):
+    @pytest.mark.parametrize('claims', [None, auth.DELETE_ATTRIBUTE])
+    def test_set_custom_user_claims_remove(self, user_mgt_app, claims):
         _, recorder = _instrument_user_manager(user_mgt_app, 200, '{"localId":"testuser"}')
-        auth.set_custom_user_claims('testuser', None, app=user_mgt_app)
+        auth.set_custom_user_claims('testuser', claims, app=user_mgt_app)
         request = json.loads(recorder[0].body.decode())
         assert request == {'localId' : 'testuser', 'customAttributes' : json.dumps({})}
 
     def test_set_custom_user_claims_error(self, user_mgt_app):
-        _instrument_user_manager(user_mgt_app, 500, '{"error":"test"}')
-        with pytest.raises(auth.AuthError) as excinfo:
+        _instrument_user_manager(user_mgt_app, 500, '{"error": {"message": "UNEXPECTED_CODE"}}')
+        with pytest.raises(exceptions.InternalError) as excinfo:
             auth.set_custom_user_claims('user', {}, app=user_mgt_app)
-        assert excinfo.value.code == _user_mgt.USER_UPDATE_ERROR
-        assert '{"error":"test"}' in str(excinfo.value)
+        assert str(excinfo.value) == 'Error while calling Auth service (UNEXPECTED_CODE).'
+        assert excinfo.value.http_response is not None
+        assert excinfo.value.cause is not None
 
 
 class TestDeleteUser(object):
@@ -500,11 +589,21 @@ class TestDeleteUser(object):
         auth.delete_user('testuser', user_mgt_app)
 
     def test_delete_user_error(self, user_mgt_app):
-        _instrument_user_manager(user_mgt_app, 500, '{"error":"test"}')
-        with pytest.raises(auth.AuthError) as excinfo:
+        _instrument_user_manager(user_mgt_app, 500, '{"error": {"message": "UNEXPECTED_CODE"}}')
+        with pytest.raises(exceptions.InternalError) as excinfo:
             auth.delete_user('user', app=user_mgt_app)
-        assert excinfo.value.code == _user_mgt.USER_DELETE_ERROR
-        assert '{"error":"test"}' in str(excinfo.value)
+        assert str(excinfo.value) == 'Error while calling Auth service (UNEXPECTED_CODE).'
+        assert excinfo.value.http_response is not None
+        assert excinfo.value.cause is not None
+
+    def test_delete_user_unexpected_response(self, user_mgt_app):
+        _instrument_user_manager(user_mgt_app, 200, '{"error": "test"}')
+        with pytest.raises(auth.UnexpectedResponseError) as excinfo:
+            auth.delete_user('user', app=user_mgt_app)
+        assert str(excinfo.value) == 'Failed to delete user: user.'
+        assert excinfo.value.http_response is not None
+        assert excinfo.value.cause is None
+        assert isinstance(excinfo.value, exceptions.UnknownError)
 
 
 class TestListUsers(object):
@@ -640,10 +739,24 @@ class TestListUsers(object):
 
     def test_list_users_error(self, user_mgt_app):
         _instrument_user_manager(user_mgt_app, 500, '{"error":"test"}')
-        with pytest.raises(auth.AuthError) as excinfo:
+        with pytest.raises(exceptions.InternalError) as excinfo:
             auth.list_users(app=user_mgt_app)
-        assert excinfo.value.code == _user_mgt.USER_DOWNLOAD_ERROR
-        assert '{"error":"test"}' in str(excinfo.value)
+        assert str(excinfo.value) == 'Unexpected error response: {"error":"test"}'
+
+    def test_permission_error(self, user_mgt_app):
+        _instrument_user_manager(
+            user_mgt_app, 400, '{"error": {"message": "INSUFFICIENT_PERMISSION"}}')
+        with pytest.raises(auth.InsufficientPermissionError) as excinfo:
+            auth.list_users(app=user_mgt_app)
+        assert isinstance(excinfo.value, exceptions.PermissionDeniedError)
+        msg = ('The credential used to initialize the SDK has insufficient '
+               'permissions to perform the requested operation. See '
+               'https://firebase.google.com/docs/admin/setup for details '
+               'on how to initialize the Admin SDK with appropriate permissions '
+               '(INSUFFICIENT_PERMISSION).')
+        assert str(excinfo.value) == msg
+        assert excinfo.value.http_response is not None
+        assert excinfo.value.cause is not None
 
     def _check_page(self, page):
         assert isinstance(page, auth.ListUsersPage)
@@ -717,6 +830,7 @@ class TestUserMetadata(object):
     def test_invalid_args(self, arg):
         with pytest.raises(ValueError):
             auth.UserMetadata(**arg)
+
 
 class TestImportUserRecord(object):
 
@@ -819,31 +933,35 @@ class TestUserImportHash(object):
         with pytest.raises(ValueError):
             func(key=key)
 
-    @pytest.mark.parametrize('func,name', [
-        (auth.UserImportHash.sha512, 'SHA512'),
-        (auth.UserImportHash.sha256, 'SHA256'),
-        (auth.UserImportHash.sha1, 'SHA1'),
-        (auth.UserImportHash.md5, 'MD5'),
-        (auth.UserImportHash.pbkdf_sha1, 'PBKDF_SHA1'),
-        (auth.UserImportHash.pbkdf2_sha256, 'PBKDF2_SHA256'),
+    @pytest.mark.parametrize('func,name,rounds', [
+        (auth.UserImportHash.md5, 'MD5', [0, 8192]),
+        (auth.UserImportHash.sha1, 'SHA1', [1, 8192]),
+        (auth.UserImportHash.sha256, 'SHA256', [1, 8192]),
+        (auth.UserImportHash.sha512, 'SHA512', [1, 8192]),
+        (auth.UserImportHash.pbkdf_sha1, 'PBKDF_SHA1', [0, 120000]),
+        (auth.UserImportHash.pbkdf2_sha256, 'PBKDF2_SHA256', [0, 120000]),
     ])
-    def test_basic(self, func, name):
-        basic = func(rounds=10)
-        expected = {
-            'hashAlgorithm': name,
-            'rounds': 10,
-        }
-        assert basic.to_dict() == expected
+    def test_basic(self, func, name, rounds):
+        for rnds in rounds:
+            basic = func(rounds=rnds)
+            expected = {
+                'hashAlgorithm': name,
+                'rounds': rnds,
+            }
+            assert basic.to_dict() == expected
 
-    @pytest.mark.parametrize('func', [
-        auth.UserImportHash.sha512, auth.UserImportHash.sha256,
-        auth.UserImportHash.sha1, auth.UserImportHash.md5,
-        auth.UserImportHash.pbkdf_sha1, auth.UserImportHash.pbkdf2_sha256,
+    @pytest.mark.parametrize('func,rounds', [
+        (auth.UserImportHash.md5, INVALID_INTS + [-1, 8193]),
+        (auth.UserImportHash.sha1, INVALID_INTS + [0, 8193]),
+        (auth.UserImportHash.sha256, INVALID_INTS + [0, 8193]),
+        (auth.UserImportHash.sha512, INVALID_INTS + [0, 8193]),
+        (auth.UserImportHash.pbkdf_sha1, INVALID_INTS + [-1, 120001]),
+        (auth.UserImportHash.pbkdf2_sha256, INVALID_INTS + [-1, 120001]),
     ])
-    @pytest.mark.parametrize('rounds', INVALID_INTS + [120001])
     def test_invalid_basic(self, func, rounds):
-        with pytest.raises(ValueError):
-            func(rounds=rounds)
+        for rnds in rounds:
+            with pytest.raises(ValueError):
+                func(rounds=rnds)
 
     def test_scrypt(self):
         scrypt = auth.UserImportHash.scrypt(
@@ -984,6 +1102,25 @@ class TestImportUsers(object):
         }
         self._check_rpc_calls(recorder, expected)
 
+    def test_import_users_http_error(self, user_mgt_app):
+        _instrument_user_manager(user_mgt_app, 401, '{"error": {"message": "ERROR_CODE"}}')
+        users = [
+            auth.ImportUserRecord(uid='user1'),
+            auth.ImportUserRecord(uid='user2'),
+        ]
+        with pytest.raises(exceptions.UnauthenticatedError) as excinfo:
+            auth.import_users(users, app=user_mgt_app)
+        assert str(excinfo.value) == 'Error while calling Auth service (ERROR_CODE).'
+
+    def test_import_users_unexpected_response(self, user_mgt_app):
+        _instrument_user_manager(user_mgt_app, 200, '"not dict"')
+        users = [
+            auth.ImportUserRecord(uid='user1'),
+            auth.ImportUserRecord(uid='user2'),
+        ]
+        with pytest.raises(auth.UnexpectedResponseError):
+            auth.import_users(users, app=user_mgt_app)
+
     def _check_rpc_calls(self, recorder, expected):
         assert len(recorder) == 1
         request = json.loads(recorder[0].body.decode())
@@ -1002,6 +1139,7 @@ class TestRevokeRefreshTokkens(object):
         assert request['localId'] == 'testuser'
         assert int(request['validSince']) >= int(before_time)
         assert int(request['validSince']) <= int(after_time)
+
 
 class TestActionCodeSetting(object):
 
@@ -1046,6 +1184,7 @@ class TestActionCodeSetting(object):
     def test_encode_action_code_bad_data(self):
         with pytest.raises(AttributeError):
             _user_mgt.encode_action_code_settings({"foo":"bar"})
+
 
 class TestGenerateEmailActionLink(object):
 
@@ -1106,9 +1245,29 @@ class TestGenerateEmailActionLink(object):
         auth.generate_password_reset_link,
     ])
     def test_api_call_failure(self, user_mgt_app, func):
-        _instrument_user_manager(user_mgt_app, 500, '{"error":"dummy error"}')
-        with pytest.raises(auth.AuthError):
+        _instrument_user_manager(user_mgt_app, 500, '{"error":{"message": "UNEXPECTED_CODE"}}')
+        with pytest.raises(exceptions.InternalError) as excinfo:
             func('test@test.com', MOCK_ACTION_CODE_SETTINGS, app=user_mgt_app)
+        assert str(excinfo.value) == 'Error while calling Auth service (UNEXPECTED_CODE).'
+        assert excinfo.value.http_response is not None
+        assert excinfo.value.cause is not None
+
+    @pytest.mark.parametrize('func', [
+        auth.generate_sign_in_with_email_link,
+        auth.generate_email_verification_link,
+        auth.generate_password_reset_link,
+    ])
+    def test_invalid_dynamic_link(self, user_mgt_app, func):
+        resp = '{"error":{"message": "INVALID_DYNAMIC_LINK_DOMAIN: Because of this reason."}}'
+        _instrument_user_manager(user_mgt_app, 500, resp)
+        with pytest.raises(auth.InvalidDynamicLinkDomainError) as excinfo:
+            func('test@test.com', MOCK_ACTION_CODE_SETTINGS, app=user_mgt_app)
+        assert isinstance(excinfo.value, exceptions.InvalidArgumentError)
+        assert str(excinfo.value) == ('Dynamic link domain specified in ActionCodeSettings is '
+                                      'not authorized (INVALID_DYNAMIC_LINK_DOMAIN). Because '
+                                      'of this reason.')
+        assert excinfo.value.http_response is not None
+        assert excinfo.value.cause is not None
 
     @pytest.mark.parametrize('func', [
         auth.generate_sign_in_with_email_link,
@@ -1117,8 +1276,12 @@ class TestGenerateEmailActionLink(object):
     ])
     def test_api_call_no_link(self, user_mgt_app, func):
         _instrument_user_manager(user_mgt_app, 200, '{}')
-        with pytest.raises(auth.AuthError):
+        with pytest.raises(auth.UnexpectedResponseError) as excinfo:
             func('test@test.com', MOCK_ACTION_CODE_SETTINGS, app=user_mgt_app)
+        assert str(excinfo.value) == 'Failed to generate email action link.'
+        assert excinfo.value.http_response is not None
+        assert excinfo.value.cause is None
+        assert isinstance(excinfo.value, exceptions.UnknownError)
 
     @pytest.mark.parametrize('func', [
         auth.generate_sign_in_with_email_link,

@@ -15,21 +15,47 @@
 """Integration tests for firebase_admin.db module."""
 import collections
 import json
+import os
 
 import pytest
 import six
 
 import firebase_admin
 from firebase_admin import db
+from firebase_admin import exceptions
 from integration import conftest
 from tests import testutils
 
 
+def integration_conf(request):
+    host_override = os.environ.get('FIREBASE_DATABASE_EMULATOR_HOST')
+    if host_override:
+        return None, 'fake-project-id'
+    else:
+        return conftest.integration_conf(request)
+
+
 @pytest.fixture(scope='module')
-def update_rules():
+def app(request):
+    cred, project_id = integration_conf(request)
+    ops = {
+        'databaseURL' : 'https://{0}.firebaseio.com'.format(project_id),
+    }
+    return firebase_admin.initialize_app(cred, ops, name='integration-db')
+
+
+@pytest.fixture(scope='module', autouse=True)
+def default_app():
+    # Overwrites the default_app fixture in conftest.py.
+    # This test suite should not use the default app. Use the app fixture instead.
+    pass
+
+
+@pytest.fixture(scope='module')
+def update_rules(app):
     with open(testutils.resource_filename('dinosaurs_index.json')) as rules_file:
         new_rules = json.load(rules_file)
-    client = db.reference()._client
+    client = db.reference('', app)._client
     rules = client.body('get', '/.settings/rules.json')
     existing = rules.get('rules')
     if existing != new_rules:
@@ -42,7 +68,7 @@ def testdata():
         return json.load(dino_file)
 
 @pytest.fixture(scope='module')
-def testref(update_rules, testdata):
+def testref(update_rules, testdata, app):
     """Adds the necessary DB indices, and sets the initial values.
 
     This fixture is attached to the module scope, and therefore is guaranteed to run only once
@@ -52,7 +78,7 @@ def testref(update_rules, testdata):
         Reference: A reference to the test dinosaur database.
     """
     del update_rules
-    ref = db.reference('_adminsdk/python/dinodb')
+    ref = db.reference('_adminsdk/python/dinodb', app)
     ref.set(testdata)
     return ref
 
@@ -304,7 +330,7 @@ class TestAdvancedQueries(object):
 @pytest.fixture(scope='module')
 def override_app(request, update_rules):
     del update_rules
-    cred, project_id = conftest.integration_conf(request)
+    cred, project_id = integration_conf(request)
     ops = {
         'databaseURL' : 'https://{0}.firebaseio.com'.format(project_id),
         'databaseAuthVariableOverride' : {'uid' : 'user1'}
@@ -316,7 +342,7 @@ def override_app(request, update_rules):
 @pytest.fixture(scope='module')
 def none_override_app(request, update_rules):
     del update_rules
-    cred, project_id = conftest.integration_conf(request)
+    cred, project_id = integration_conf(request)
     ops = {
         'databaseURL' : 'https://{0}.firebaseio.com'.format(project_id),
         'databaseAuthVariableOverride' : None
@@ -329,39 +355,35 @@ def none_override_app(request, update_rules):
 class TestAuthVariableOverride(object):
     """Test cases for database auth variable overrides."""
 
-    def init_ref(self, path):
-        admin_ref = db.reference(path)
+    def init_ref(self, path, app):
+        admin_ref = db.reference(path, app)
         admin_ref.set('test')
         assert admin_ref.get() == 'test'
 
-    def check_permission_error(self, excinfo):
-        assert isinstance(excinfo.value, db.ApiCallError)
-        assert 'Reason: Permission denied' in str(excinfo.value)
-
-    def test_no_access(self, override_app):
+    def test_no_access(self, app, override_app):
         path = '_adminsdk/python/admin'
-        self.init_ref(path)
+        self.init_ref(path, app)
         user_ref = db.reference(path, override_app)
-        with pytest.raises(db.ApiCallError) as excinfo:
+        with pytest.raises(exceptions.UnauthenticatedError) as excinfo:
             assert user_ref.get()
-        self.check_permission_error(excinfo)
+        assert str(excinfo.value) == 'Permission denied'
 
-        with pytest.raises(db.ApiCallError) as excinfo:
+        with pytest.raises(exceptions.UnauthenticatedError) as excinfo:
             user_ref.set('test2')
-        self.check_permission_error(excinfo)
+        assert str(excinfo.value) == 'Permission denied'
 
-    def test_read(self, override_app):
+    def test_read(self, app, override_app):
         path = '_adminsdk/python/protected/user2'
-        self.init_ref(path)
+        self.init_ref(path, app)
         user_ref = db.reference(path, override_app)
         assert user_ref.get() == 'test'
-        with pytest.raises(db.ApiCallError) as excinfo:
+        with pytest.raises(exceptions.UnauthenticatedError) as excinfo:
             user_ref.set('test2')
-        self.check_permission_error(excinfo)
+        assert str(excinfo.value) == 'Permission denied'
 
-    def test_read_write(self, override_app):
+    def test_read_write(self, app, override_app):
         path = '_adminsdk/python/protected/user1'
-        self.init_ref(path)
+        self.init_ref(path, app)
         user_ref = db.reference(path, override_app)
         assert user_ref.get() == 'test'
         user_ref.set('test2')
@@ -369,25 +391,25 @@ class TestAuthVariableOverride(object):
 
     def test_query(self, override_app):
         user_ref = db.reference('_adminsdk/python/protected', override_app)
-        with pytest.raises(db.ApiCallError) as excinfo:
+        with pytest.raises(exceptions.UnauthenticatedError) as excinfo:
             user_ref.order_by_key().limit_to_first(2).get()
-        self.check_permission_error(excinfo)
+        assert str(excinfo.value) == 'Permission denied'
 
-    def test_none_auth_override(self, none_override_app):
+    def test_none_auth_override(self, app, none_override_app):
         path = '_adminsdk/python/public'
-        self.init_ref(path)
+        self.init_ref(path, app)
         public_ref = db.reference(path, none_override_app)
         assert public_ref.get() == 'test'
 
         ref = db.reference('_adminsdk/python', none_override_app)
-        with pytest.raises(db.ApiCallError) as excinfo:
+        with pytest.raises(exceptions.UnauthenticatedError) as excinfo:
             assert ref.child('protected/user1').get()
-        self.check_permission_error(excinfo)
+        assert str(excinfo.value) == 'Permission denied'
 
-        with pytest.raises(db.ApiCallError) as excinfo:
+        with pytest.raises(exceptions.UnauthenticatedError) as excinfo:
             assert ref.child('protected/user2').get()
-        self.check_permission_error(excinfo)
+        assert str(excinfo.value) == 'Permission denied'
 
-        with pytest.raises(db.ApiCallError) as excinfo:
+        with pytest.raises(exceptions.UnauthenticatedError) as excinfo:
             assert ref.child('admin').get()
-        self.check_permission_error(excinfo)
+        assert str(excinfo.value) == 'Permission denied'

@@ -22,6 +22,7 @@ import pytest
 
 import firebase_admin
 from firebase_admin import db
+from firebase_admin import exceptions
 from firebase_admin import _sseclient
 from tests import testutils
 
@@ -31,14 +32,15 @@ class MockAdapter(testutils.MockAdapter):
 
     ETAG = '0'
 
-    def __init__(self, data, status, recorder):
+    def __init__(self, data, status, recorder, etag=ETAG):
         testutils.MockAdapter.__init__(self, data, status, recorder)
+        self._etag = etag
 
     def send(self, request, **kwargs):
         if_match = request.headers.get('if-match')
         if_none_match = request.headers.get('if-none-match')
         resp = super(MockAdapter, self).send(request, **kwargs)
-        resp.headers = {'ETag': MockAdapter.ETAG}
+        resp.headers = {'ETag': self._etag}
         if if_match and if_match != MockAdapter.ETAG:
             resp.status_code = 412
         elif if_none_match == MockAdapter.ETAG:
@@ -125,6 +127,38 @@ class TestReferencePath(object):
             parent.child(child)
 
 
+class _RefOperations(object):
+    """A collection of operations that can be performed using a ``db.Reference``.
+
+    This can be used to test any functionality that is common across multiple API calls.
+    """
+
+    @classmethod
+    def get(cls, ref):
+        ref.get()
+
+    @classmethod
+    def push(cls, ref):
+        ref.push()
+
+    @classmethod
+    def set(cls, ref):
+        ref.set({'foo': 'bar'})
+
+    @classmethod
+    def delete(cls, ref):
+        ref.delete()
+
+    @classmethod
+    def query(cls, ref):
+        query = ref.order_by_key()
+        query.get()
+
+    @classmethod
+    def get_ops(cls):
+        return [cls.get, cls.push, cls.set, cls.delete, cls.query]
+
+
 class TestReference(object):
     """Test cases for database queries via References."""
 
@@ -132,6 +166,12 @@ class TestReference(object):
     valid_values = [
         '', 'foo', 0, 1, 100, 1.2, True, False, [], [1, 2], {}, {'foo' : 'bar'}
     ]
+    error_codes = {
+        400: exceptions.InvalidArgumentError,
+        401: exceptions.UnauthenticatedError,
+        404: exceptions.NotFoundError,
+        500: exceptions.InternalError,
+    }
 
     @classmethod
     def setup_class(cls):
@@ -141,9 +181,9 @@ class TestReference(object):
     def teardown_class(cls):
         testutils.cleanup_apps()
 
-    def instrument(self, ref, payload, status=200):
+    def instrument(self, ref, payload, status=200, etag=MockAdapter.ETAG):
         recorder = []
-        adapter = MockAdapter(payload, status, recorder)
+        adapter = MockAdapter(payload, status, recorder, etag)
         ref._client.session.mount(self.test_url, adapter)
         return recorder
 
@@ -427,6 +467,19 @@ class TestReference(object):
         assert len(recorder) == 1
         assert recorder[0].method == 'GET'
 
+    def test_transaction_abort(self):
+        ref = db.reference('/test/count')
+        data = 42
+        recorder = self.instrument(ref, json.dumps(data), etag='1')
+
+        with pytest.raises(db.TransactionAbortedError) as excinfo:
+            ref.transaction(lambda x: x + 1 if x else 1)
+        assert isinstance(excinfo.value, exceptions.AbortedError)
+        assert str(excinfo.value) == 'Transaction aborted after failed retries.'
+        assert excinfo.value.cause is None
+        assert excinfo.value.http_response is None
+        assert len(recorder) == 1 + 25
+
     @pytest.mark.parametrize('func', [None, 0, 1, True, False, 'foo', dict(), list(), tuple()])
     def test_transaction_invalid_function(self, func):
         ref = db.reference('/test')
@@ -449,21 +502,29 @@ class TestReference(object):
         else:
             assert ref.parent.path == parent
 
-    @pytest.mark.parametrize('error_code', [400, 401, 500])
-    def test_server_error(self, error_code):
+    @pytest.mark.parametrize('error_code', error_codes.keys())
+    @pytest.mark.parametrize('func', _RefOperations.get_ops())
+    def test_server_error(self, error_code, func):
         ref = db.reference('/test')
         self.instrument(ref, json.dumps({'error' : 'json error message'}), error_code)
-        with pytest.raises(db.ApiCallError) as excinfo:
-            ref.get()
-        assert 'Reason: json error message' in str(excinfo.value)
+        exc_type = self.error_codes[error_code]
+        with pytest.raises(exc_type) as excinfo:
+            func(ref)
+        assert str(excinfo.value) == 'json error message'
+        assert excinfo.value.cause is not None
+        assert excinfo.value.http_response is not None
 
-    @pytest.mark.parametrize('error_code', [400, 401, 500])
-    def test_other_error(self, error_code):
+    @pytest.mark.parametrize('error_code', error_codes.keys())
+    @pytest.mark.parametrize('func', _RefOperations.get_ops())
+    def test_other_error(self, error_code, func):
         ref = db.reference('/test')
         self.instrument(ref, 'custom error message', error_code)
-        with pytest.raises(db.ApiCallError) as excinfo:
-            ref.get()
-        assert 'Reason: custom error message' in str(excinfo.value)
+        exc_type = self.error_codes[error_code]
+        with pytest.raises(exc_type) as excinfo:
+            func(ref)
+        assert str(excinfo.value) == 'Unexpected response from database: custom error message'
+        assert excinfo.value.cause is not None
+        assert excinfo.value.http_response is not None
 
 
 class TestListenerRegistration(object):
@@ -481,9 +542,11 @@ class TestListenerRegistration(object):
             session.mount(test_url, adapter)
             def callback(_):
                 pass
-            with pytest.raises(db.ApiCallError) as excinfo:
+            with pytest.raises(exceptions.InternalError) as excinfo:
                 ref._listen_with_session(callback, session)
-            assert 'Reason: json error message' in str(excinfo.value)
+            assert str(excinfo.value) == 'json error message'
+            assert excinfo.value.cause is not None
+            assert excinfo.value.http_response is not None
         finally:
             testutils.cleanup_apps()
 
@@ -623,6 +686,45 @@ class TestDatabaseInitialization(object):
         with pytest.raises(ValueError):
             db.reference()
 
+    @pytest.mark.parametrize(
+        'url,emulator_host,expected_base_url,expected_namespace',
+        [
+            # Production URLs with no override:
+            ('https://test.firebaseio.com', None, 'https://test.firebaseio.com', 'test'),
+            ('https://test.firebaseio.com/', None, 'https://test.firebaseio.com', 'test'),
+
+            # Production URLs with emulator_host override:
+            ('https://test.firebaseio.com', 'localhost:9000', 'http://localhost:9000', 'test'),
+            ('https://test.firebaseio.com/', 'localhost:9000', 'http://localhost:9000', 'test'),
+
+            # Emulator URLs with no override.
+            ('http://localhost:8000/?ns=test', None, 'http://localhost:8000', 'test'),
+            # emulator_host is ignored when the original URL is already emulator.
+            ('http://localhost:8000/?ns=test', 'localhost:9999', 'http://localhost:8000', 'test'),
+        ]
+    )
+    def test_parse_db_url(self, url, emulator_host, expected_base_url, expected_namespace):
+        base_url, namespace = db._DatabaseService._parse_db_url(url, emulator_host)
+        assert base_url == expected_base_url
+        assert namespace == expected_namespace
+
+    @pytest.mark.parametrize('url,emulator_host', [
+        ('', None),
+        (None, None),
+        (42, None),
+        ('test.firebaseio.com', None),  # Not a URL.
+        ('http://test.firebaseio.com', None),  # Use of non-HTTPs in production URLs.
+        ('ftp://test.firebaseio.com', None),  # Use of non-HTTPs in production URLs.
+        ('https://example.com', None),  # Invalid RTDB URL.
+        ('http://localhost:9000/', None),  # No ns specified.
+        ('http://localhost:9000/?ns=', None),  # No ns specified.
+        ('http://localhost:9000/?ns=test1&ns=test2', None),  # Two ns parameters specified.
+        ('ftp://localhost:9000/?ns=test', None),  # Neither HTTP or HTTPS.
+    ])
+    def test_parse_db_url_errors(self, url, emulator_host):
+        with pytest.raises(ValueError):
+            db._DatabaseService._parse_db_url(url, emulator_host)
+
     @pytest.mark.parametrize('url', [
         'https://test.firebaseio.com', 'https://test.firebaseio.com/'
     ])
@@ -633,7 +735,7 @@ class TestDatabaseInitialization(object):
         adapter = MockAdapter('{}', 200, recorder)
         ref._client.session.mount(url, adapter)
         assert ref._client.base_url == 'https://test.firebaseio.com'
-        assert ref._client.auth_override is None
+        assert 'auth_variable_override' not in ref._client.params
         assert ref._client.timeout is None
         assert ref.get() == {}
         assert len(recorder) == 1
@@ -658,7 +760,7 @@ class TestDatabaseInitialization(object):
         })
         ref = db.reference()
         assert ref._client.base_url == default_url
-        assert ref._client.auth_override is None
+        assert 'auth_variable_override' not in ref._client.params
         assert ref._client.timeout is None
         assert ref._client is db.reference()._client
         assert ref._client is db.reference(url=default_url)._client
@@ -666,7 +768,7 @@ class TestDatabaseInitialization(object):
         other_url = 'https://other.firebaseio.com'
         other_ref = db.reference(url=other_url)
         assert other_ref._client.base_url == other_url
-        assert other_ref._client.auth_override is None
+        assert 'auth_variable_override' not in ref._client.params
         assert other_ref._client.timeout is None
         assert other_ref._client is db.reference(url=other_url)._client
         assert other_ref._client is db.reference(url=other_url + '/')._client
@@ -682,10 +784,10 @@ class TestDatabaseInitialization(object):
         for ref in [default_ref, other_ref]:
             assert ref._client.timeout is None
             if override == {}:
-                assert ref._client.auth_override is None
+                assert 'auth_variable_override' not in ref._client.params
             else:
                 encoded = json.dumps(override, separators=(',', ':'))
-                assert ref._client.auth_override == 'auth_variable_override={0}'.format(encoded)
+                assert ref._client.params['auth_variable_override'] == encoded
 
     @pytest.mark.parametrize('override', [
         '', 'foo', 0, 1, True, False, list(), tuple(), _Object()])

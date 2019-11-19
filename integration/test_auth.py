@@ -29,6 +29,7 @@ from firebase_admin import credentials
 import google.oauth2.credentials
 from google.auth import transport
 
+
 _verify_token_url = 'https://www.googleapis.com/identitytoolkit/v3/relyingparty/verifyCustomToken'
 _verify_password_url = 'https://www.googleapis.com/identitytoolkit/v3/relyingparty/verifyPassword'
 _password_reset_url = 'https://www.googleapis.com/identitytoolkit/v3/relyingparty/resetPassword'
@@ -129,25 +130,30 @@ def test_session_cookies(api_key):
     estimated_exp = int(time.time() + expires_in.total_seconds())
     assert abs(claims['exp'] - estimated_exp) < 5
 
+def test_session_cookie_error():
+    expires_in = datetime.timedelta(days=1)
+    with pytest.raises(auth.InvalidIdTokenError):
+        auth.create_session_cookie('not.a.token', expires_in=expires_in)
+
 def test_get_non_existing_user():
-    with pytest.raises(auth.AuthError) as excinfo:
+    with pytest.raises(auth.UserNotFoundError) as excinfo:
         auth.get_user('non.existing')
-    assert 'USER_NOT_FOUND_ERROR' in str(excinfo.value.code)
+    assert str(excinfo.value) == 'No user record found for the provided user ID: non.existing.'
 
 def test_get_non_existing_user_by_email():
-    with pytest.raises(auth.AuthError) as excinfo:
+    with pytest.raises(auth.UserNotFoundError) as excinfo:
         auth.get_user_by_email('non.existing@definitely.non.existing')
-    assert 'USER_NOT_FOUND_ERROR' in str(excinfo.value.code)
+    error_msg = ('No user record found for the provided email: '
+                 'non.existing@definitely.non.existing.')
+    assert str(excinfo.value) == error_msg
 
 def test_update_non_existing_user():
-    with pytest.raises(auth.AuthError) as excinfo:
+    with pytest.raises(auth.UserNotFoundError):
         auth.update_user('non.existing')
-    assert 'USER_UPDATE_ERROR' in str(excinfo.value.code)
 
 def test_delete_non_existing_user():
-    with pytest.raises(auth.AuthError) as excinfo:
+    with pytest.raises(auth.UserNotFoundError):
         auth.delete_user('non.existing')
-    assert 'USER_DELETE_ERROR' in str(excinfo.value.code)
 
 @pytest.fixture
 def new_user():
@@ -214,6 +220,10 @@ def test_get_user(new_user_with_params):
     assert provider_ids == ['password', 'phone']
 
 def test_list_users(new_user_list):
+    err_msg_template = (
+        'Missing {field} field. A common cause would be forgetting to add the "Firebase ' +
+        'Authentication Admin" permission. See instructions in CONTRIBUTING.md')
+
     fetched = []
     # Test exporting all user accounts.
     page = auth.list_users()
@@ -222,8 +232,10 @@ def test_list_users(new_user_list):
             assert isinstance(user, auth.ExportedUserRecord)
             if user.uid in new_user_list:
                 fetched.append(user.uid)
-                assert user.password_hash is not None
-                assert user.password_salt is not None
+                assert user.password_hash is not None, (
+                    err_msg_template.format(field='password_hash'))
+                assert user.password_salt is not None, (
+                    err_msg_template.format(field='password_salt'))
         page = page.get_next_page()
     assert len(fetched) == len(new_user_list)
 
@@ -233,8 +245,10 @@ def test_list_users(new_user_list):
         assert isinstance(user, auth.ExportedUserRecord)
         if user.uid in new_user_list:
             fetched.append(user.uid)
-            assert user.password_hash is not None
-            assert user.password_salt is not None
+            assert user.password_hash is not None, (
+                err_msg_template.format(field='password_hash'))
+            assert user.password_salt is not None, (
+                err_msg_template.format(field='password_salt'))
     assert len(fetched) == len(new_user_list)
 
 def test_create_user(new_user):
@@ -250,9 +264,8 @@ def test_create_user(new_user):
     assert user.user_metadata.creation_timestamp > 0
     assert user.user_metadata.last_sign_in_timestamp is None
     assert len(user.provider_data) is 0
-    with pytest.raises(auth.AuthError) as excinfo:
+    with pytest.raises(auth.UidAlreadyExistsError):
         auth.create_user(uid=new_user.uid)
-    assert excinfo.value.code == 'USER_CREATE_ERROR'
 
 def test_update_user(new_user):
     _, email = _random_id()
@@ -305,9 +318,9 @@ def test_update_custom_user_claims(new_user):
 def test_disable_user(new_user_with_params):
     user = auth.update_user(
         new_user_with_params.uid,
-        display_name=None,
-        photo_url=None,
-        phone_number=None,
+        display_name=auth.DELETE_ATTRIBUTE,
+        photo_url=auth.DELETE_ATTRIBUTE,
+        phone_number=auth.DELETE_ATTRIBUTE,
         disabled=True)
     assert user.uid == new_user_with_params.uid
     assert user.email == new_user_with_params.email
@@ -321,9 +334,8 @@ def test_disable_user(new_user_with_params):
 def test_delete_user():
     user = auth.create_user()
     auth.delete_user(user.uid)
-    with pytest.raises(auth.AuthError) as excinfo:
+    with pytest.raises(auth.UserNotFoundError):
         auth.get_user(user.uid)
-    assert excinfo.value.code == 'USER_NOT_FOUND_ERROR'
 
 def test_revoke_refresh_tokens(new_user):
     user = auth.get_user(new_user.uid)
@@ -347,9 +359,8 @@ def test_verify_id_token_revoked(new_user, api_key):
     # verify_id_token succeeded because it didn't check revoked.
     assert claims['iat'] * 1000 < user.tokens_valid_after_timestamp
 
-    with pytest.raises(auth.AuthError) as excinfo:
+    with pytest.raises(auth.RevokedIdTokenError) as excinfo:
         claims = auth.verify_id_token(id_token, check_revoked=True)
-    assert excinfo.value.code == auth._ID_TOKEN_REVOKED
     assert str(excinfo.value) == 'The Firebase ID token has been revoked.'
 
     # Sign in again, verify works.
@@ -369,9 +380,8 @@ def test_verify_session_cookie_revoked(new_user, api_key):
     # verify_session_cookie succeeded because it didn't check revoked.
     assert claims['iat'] * 1000 < user.tokens_valid_after_timestamp
 
-    with pytest.raises(auth.AuthError) as excinfo:
+    with pytest.raises(auth.RevokedSessionCookieError) as excinfo:
         claims = auth.verify_session_cookie(session_cookie, check_revoked=True)
-    assert excinfo.value.code == auth._SESSION_COOKIE_REVOKED
     assert str(excinfo.value) == 'The Firebase session cookie has been revoked.'
 
     # Sign in again, verify works.

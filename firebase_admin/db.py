@@ -22,14 +22,17 @@ module uses the Firebase REST API underneath.
 
 import collections
 import json
+import os
 import sys
 import threading
 
+import google.auth
 import requests
 import six
 from six.moves import urllib
 
 import firebase_admin
+from firebase_admin import exceptions
 from firebase_admin import _http_client
 from firebase_admin import _sseclient
 from firebase_admin import _utils
@@ -41,6 +44,7 @@ _RESERVED_FILTERS = ('$key', '$value', '$priority')
 _USER_AGENT = 'Firebase/HTTP/{0}/{1}.{2}/AdminPython'.format(
     firebase_admin.__version__, sys.version_info.major, sys.version_info.minor)
 _TRANSACTION_MAX_RETRIES = 25
+_EMULATOR_HOST_ENV_VAR = 'FIREBASE_DATABASE_EMULATOR_HOST'
 
 
 def reference(path='/', app=None, url=None):
@@ -206,7 +210,7 @@ class Reference(object):
 
         Raises:
           ValueError: If both ``etag`` and ``shallow`` are set to True.
-          ApiCallError: If an error occurs while communicating with the remote database server.
+          FirebaseError: If an error occurs while communicating with the remote database server.
         """
         if etag:
             if shallow:
@@ -233,7 +237,7 @@ class Reference(object):
 
         Raises:
           ValueError: If the ETag is not a string.
-          ApiCallError: If an error occurs while communicating with the remote database server.
+          FirebaseError: If an error occurs while communicating with the remote database server.
         """
         if not isinstance(etag, six.string_types):
             raise ValueError('ETag must be a string.')
@@ -255,7 +259,7 @@ class Reference(object):
         Raises:
           ValueError: If the provided value is None.
           TypeError: If the value is not JSON-serializable.
-          ApiCallError: If an error occurs while communicating with the remote database server.
+          FirebaseError: If an error occurs while communicating with the remote database server.
         """
         if value is None:
             raise ValueError('Value must not be None.')
@@ -278,7 +282,7 @@ class Reference(object):
 
         Raises:
           ValueError: If the value is None, or if expected_etag is not a string.
-          ApiCallError: If an error occurs while communicating with the remote database server.
+          FirebaseError: If an error occurs while communicating with the remote database server.
         """
         # pylint: disable=missing-raises-doc
         if not isinstance(expected_etag, six.string_types):
@@ -290,11 +294,11 @@ class Reference(object):
             headers = self._client.headers(
                 'put', self._add_suffix(), json=value, headers={'if-match': expected_etag})
             return True, value, headers.get('ETag')
-        except ApiCallError as error:
-            detail = error.detail
-            if detail.response is not None and 'ETag' in detail.response.headers:
-                etag = detail.response.headers['ETag']
-                snapshot = detail.response.json()
+        except exceptions.FailedPreconditionError as error:
+            http_response = error.http_response
+            if http_response is not None and 'ETag' in http_response.headers:
+                etag = http_response.headers['ETag']
+                snapshot = http_response.json()
                 return False, snapshot, etag
             else:
                 raise error
@@ -314,7 +318,7 @@ class Reference(object):
         Raises:
           ValueError: If the value is None.
           TypeError: If the value is not JSON-serializable.
-          ApiCallError: If an error occurs while communicating with the remote database server.
+          FirebaseError: If an error occurs while communicating with the remote database server.
         """
         if value is None:
             raise ValueError('Value must not be None.')
@@ -330,7 +334,7 @@ class Reference(object):
 
         Raises:
           ValueError: If value is empty or not a dictionary.
-          ApiCallError: If an error occurs while communicating with the remote database server.
+          FirebaseError: If an error occurs while communicating with the remote database server.
         """
         if not value or not isinstance(value, dict):
             raise ValueError('Value argument must be a non-empty dictionary.')
@@ -342,7 +346,7 @@ class Reference(object):
         """Deletes this node from the database.
 
         Raises:
-          ApiCallError: If an error occurs while communicating with the remote database server.
+          FirebaseError: If an error occurs while communicating with the remote database server.
         """
         self._client.request('delete', self._add_suffix())
 
@@ -351,7 +355,7 @@ class Reference(object):
 
         The specified callback function will get invoked with ``db.Event`` objects for each
         realtime update received from the database. It will also get called whenever the SDK
-        reconnects to the server due to network issues and credential expiration. In general,
+        reconnects to the server due to network issues or credential expiration. In general,
         the OAuth2 credentials used to authorize connections to the server expire every hour.
         Therefore clients should expect the ``callback`` to fire at least once every hour, even if
         there are no updates in the database.
@@ -368,7 +372,7 @@ class Reference(object):
           ListenerRegistration: An object that can be used to stop the event listener.
 
         Raises:
-          ApiCallError: If an error occurs while starting the initial HTTP connection.
+          FirebaseError: If an error occurs while starting the initial HTTP connection.
         """
         session = _sseclient.KeepAuthSession(self._client.credential, self._client.timeout)
         return self._listen_with_session(callback, session)
@@ -384,9 +388,9 @@ class Reference(object):
         value of this reference into a new value. If another client writes to this location before
         the new value is successfully saved, the update function is called again with the new
         current value, and the write will be retried. In case of repeated failures, this method
-        will retry the transaction up to 25 times before giving up and raising a TransactionError.
-        The update function may also force an early abort by raising an exception instead of
-        returning a value.
+        will retry the transaction up to 25 times before giving up and raising a
+        TransactionAbortedError. The update function may also force an early abort by raising an
+        exception instead of returning a value.
 
         Args:
           transaction_update: A function which will be passed the current data stored at this
@@ -399,7 +403,7 @@ class Reference(object):
           object: New value of the current database Reference (only if the transaction commits).
 
         Raises:
-          TransactionError: If the transaction aborts after exhausting all retry attempts.
+          TransactionAbortedError: If the transaction aborts after exhausting all retry attempts.
           ValueError: If transaction_update is not a function.
         """
         if not callable(transaction_update):
@@ -413,7 +417,8 @@ class Reference(object):
             if success:
                 return new_data
             tries += 1
-        raise TransactionError('Transaction aborted after failed retries.')
+
+        raise TransactionAbortedError('Transaction aborted after failed retries.')
 
     def order_by_child(self, path):
         """Returns a Query that orders data by child values.
@@ -465,7 +470,7 @@ class Reference(object):
             sse = _sseclient.SSEClient(url, session)
             return ListenerRegistration(callback, sse)
         except requests.exceptions.RequestException as error:
-            raise ApiCallError(_Client.extract_error_message(error), error)
+            raise _Client.handle_rtdb_error(error)
 
 
 class Query(object):
@@ -611,7 +616,7 @@ class Query(object):
           object: Decoded JSON result of the Query.
 
         Raises:
-          ApiCallError: If an error occurs while communicating with the remote database server.
+          FirebaseError: If an error occurs while communicating with the remote database server.
         """
         result = self._client.body('get', self._pathurl, params=self._querystr)
         if isinstance(result, (dict, list)) and self._order_by != '$priority':
@@ -619,20 +624,11 @@ class Query(object):
         return result
 
 
-class ApiCallError(Exception):
-    """Represents an Exception encountered while invoking the Firebase database server API."""
-
-    def __init__(self, message, error):
-        Exception.__init__(self, message)
-        self.detail = error
-
-
-class TransactionError(Exception):
-    """Represents an Exception encountered while performing a transaction."""
+class TransactionAbortedError(exceptions.AbortedError):
+    """A transaction was aborted aftr exceeding the maximum number of retries."""
 
     def __init__(self, message):
-        Exception.__init__(self, message)
-
+        exceptions.AbortedError.__init__(self, message)
 
 
 class _Sorter(object):
@@ -768,46 +764,108 @@ class _DatabaseService(object):
     _DEFAULT_AUTH_OVERRIDE = '_admin_'
 
     def __init__(self, app):
-        self._credential = app.credential.get_credential()
+        self._credential = app.credential
         db_url = app.options.get('databaseURL')
         if db_url:
-            self._db_url = _DatabaseService._validate_url(db_url)
+            _DatabaseService._parse_db_url(db_url)  # Just for validation.
+            self._db_url = db_url
         else:
             self._db_url = None
         auth_override = _DatabaseService._get_auth_override(app)
         if auth_override != self._DEFAULT_AUTH_OVERRIDE and auth_override != {}:
-            encoded = json.dumps(auth_override, separators=(',', ':'))
-            self._auth_override = 'auth_variable_override={0}'.format(encoded)
+            self._auth_override = json.dumps(auth_override, separators=(',', ':'))
         else:
             self._auth_override = None
         self._timeout = app.options.get('httpTimeout')
         self._clients = {}
 
-    def get_client(self, base_url=None):
-        if base_url is None:
-            base_url = self._db_url
-        base_url = _DatabaseService._validate_url(base_url)
-        if base_url not in self._clients:
-            client = _Client(self._credential, base_url, self._auth_override, self._timeout)
-            self._clients[base_url] = client
-        return self._clients[base_url]
+        emulator_host = os.environ.get(_EMULATOR_HOST_ENV_VAR)
+        if emulator_host:
+            if '//' in emulator_host:
+                raise ValueError(
+                    'Invalid {0}: "{1}". It must follow format "host:port".'.format(
+                        _EMULATOR_HOST_ENV_VAR, emulator_host))
+            self._emulator_host = emulator_host
+        else:
+            self._emulator_host = None
+
+    def get_client(self, db_url=None):
+        """Creates a client based on the db_url. Clients may be cached."""
+        if db_url is None:
+            db_url = self._db_url
+
+        base_url, namespace = _DatabaseService._parse_db_url(db_url, self._emulator_host)
+        if base_url == 'https://{0}.firebaseio.com'.format(namespace):
+            # Production base_url. No need to specify namespace in query params.
+            params = {}
+            credential = self._credential.get_credential()
+        else:
+            # Emulator base_url. Use fake credentials and specify ?ns=foo in query params.
+            credential = _EmulatorAdminCredentials()
+            params = {'ns': namespace}
+        if self._auth_override:
+            params['auth_variable_override'] = self._auth_override
+
+        client_cache_key = (base_url, json.dumps(params, sort_keys=True))
+        if client_cache_key not in self._clients:
+            client = _Client(credential, base_url, self._timeout, params)
+            self._clients[client_cache_key] = client
+        return self._clients[client_cache_key]
 
     @classmethod
-    def _validate_url(cls, url):
-        """Parses and validates a given database URL."""
+    def _parse_db_url(cls, url, emulator_host=None):
+        """Parses (base_url, namespace) from a database URL.
+
+        The input can be either a production URL (https://foo-bar.firebaseio.com/)
+        or an Emulator URL (http://localhost:8080/?ns=foo-bar). In case of Emulator
+        URL, the namespace is extracted from the query param ns. The resulting
+        base_url never includes query params.
+
+        If url is a production URL and emulator_host is specified, the result
+        base URL will use emulator_host instead. emulator_host is ignored
+        if url is already an emulator URL.
+        """
         if not url or not isinstance(url, six.string_types):
             raise ValueError(
                 'Invalid database URL: "{0}". Database URL must be a non-empty '
                 'URL string.'.format(url))
-        parsed = urllib.parse.urlparse(url)
-        if parsed.scheme != 'https':
+        parsed_url = urllib.parse.urlparse(url)
+        if parsed_url.netloc.endswith('.firebaseio.com'):
+            return cls._parse_production_url(parsed_url, emulator_host)
+        else:
+            return cls._parse_emulator_url(parsed_url)
+
+    @classmethod
+    def _parse_production_url(cls, parsed_url, emulator_host):
+        """Parses production URL like https://foo-bar.firebaseio.com/"""
+        if parsed_url.scheme != 'https':
             raise ValueError(
-                'Invalid database URL: "{0}". Database URL must be an HTTPS URL.'.format(url))
-        elif not parsed.netloc.endswith('.firebaseio.com'):
+                'Invalid database URL scheme: "{0}". Database URL must be an HTTPS URL.'.format(
+                    parsed_url.scheme))
+        namespace = parsed_url.netloc.split('.')[0]
+        if not namespace:
             raise ValueError(
                 'Invalid database URL: "{0}". Database URL must be a valid URL to a '
-                'Firebase Realtime Database instance.'.format(url))
-        return 'https://{0}'.format(parsed.netloc)
+                'Firebase Realtime Database instance.'.format(parsed_url.geturl()))
+
+        if emulator_host:
+            base_url = 'http://{0}'.format(emulator_host)
+        else:
+            base_url = 'https://{0}'.format(parsed_url.netloc)
+        return base_url, namespace
+
+    @classmethod
+    def _parse_emulator_url(cls, parsed_url):
+        """Parses emulator URL like http://localhost:8080/?ns=foo-bar"""
+        query_ns = urllib.parse.parse_qs(parsed_url.query).get('ns')
+        if parsed_url.scheme != 'http' or (not query_ns or len(query_ns) != 1 or not query_ns[0]):
+            raise ValueError(
+                'Invalid database URL: "{0}". Database URL must be a valid URL to a '
+                'Firebase Realtime Database instance.'.format(parsed_url.geturl()))
+
+        namespace = query_ns[0]
+        base_url = '{0}://{1}'.format(parsed_url.scheme, parsed_url.netloc)
+        return base_url, namespace
 
     @classmethod
     def _get_auth_override(cls, app):
@@ -833,7 +891,7 @@ class _Client(_http_client.JsonHttpClient):
     marshalling and unmarshalling of JSON data.
     """
 
-    def __init__(self, credential, base_url, auth_override, timeout):
+    def __init__(self, credential, base_url, timeout, params=None):
         """Creates a new _Client from the given parameters.
 
         This exists primarily to enable testing. For regular use, obtain _Client instances by
@@ -843,22 +901,21 @@ class _Client(_http_client.JsonHttpClient):
           credential: A Google credential that can be used to authenticate requests.
           base_url: A URL prefix to be added to all outgoing requests. This is typically the
               Firebase Realtime Database URL.
-          auth_override: The encoded auth_variable_override query parameter to be included in
-              outgoing requests.
           timeout: HTTP request timeout in seconds. If not set connections will never
               timeout, which is the default behavior of the underlying requests library.
+          params: Dict of query parameters to add to all outgoing requests.
         """
         _http_client.JsonHttpClient.__init__(
             self, credential=credential, base_url=base_url, headers={'User-Agent': _USER_AGENT})
         self.credential = credential
-        self.auth_override = auth_override
         self.timeout = timeout
+        self.params = params if params else {}
 
     def request(self, method, url, **kwargs):
         """Makes an HTTP call using the Python requests library.
 
-        Extends the request() method of the parent JsonHttpClient class. Handles auth overrides,
-        and low-level exceptions.
+        Extends the request() method of the parent JsonHttpClient class. Handles default
+        params like auth overrides, and low-level exceptions.
 
         Args:
           method: HTTP method name as a string (e.g. get, post).
@@ -870,44 +927,61 @@ class _Client(_http_client.JsonHttpClient):
           Response: An HTTP response object.
 
         Raises:
-          ApiCallError: If an error occurs while making the HTTP call.
+          FirebaseError: If an error occurs while making the HTTP call.
         """
-        if self.auth_override:
-            params = kwargs.get('params')
-            if params:
-                params += '&{0}'.format(self.auth_override)
+        query = '&'.join('{0}={1}'.format(key, self.params[key]) for key in self.params)
+        extra_params = kwargs.get('params')
+        if extra_params:
+            if query:
+                query = extra_params + '&' + query
             else:
-                params = self.auth_override
-            kwargs['params'] = params
+                query = extra_params
+        kwargs['params'] = query
+
         if self.timeout:
             kwargs['timeout'] = self.timeout
         try:
             return super(_Client, self).request(method, url, **kwargs)
         except requests.exceptions.RequestException as error:
-            raise ApiCallError(_Client.extract_error_message(error), error)
+            raise _Client.handle_rtdb_error(error)
 
     @classmethod
-    def extract_error_message(cls, error):
-        """Extracts an error message from an exception.
+    def handle_rtdb_error(cls, error):
+        """Converts an error encountered while calling RTDB into a FirebaseError."""
+        if error.response is None:
+            return _utils.handle_requests_error(error)
 
-        If the server has not sent any response, simply converts the exception into a string.
+        message = cls._extract_error_message(error.response)
+        return _utils.handle_requests_error(error, message=message)
+
+    @classmethod
+    def _extract_error_message(cls, response):
+        """Extracts an error message from an error response.
+
         If the server has sent a JSON response with an 'error' field, which is the typical
         behavior of the Realtime Database REST API, parses the response to retrieve the error
         message. If the server has sent a non-JSON response, returns the full response
         as the error message.
-
-        Args:
-          error: An exception raised by the requests library.
-
-        Returns:
-          str: A string error message extracted from the exception.
         """
-        if error.response is None:
-            return str(error)
+        message = None
         try:
-            data = error.response.json()
+            # RTDB error format: {"error": "text message"}
+            data = response.json()
             if isinstance(data, dict):
-                return '{0}\nReason: {1}'.format(error, data.get('error', 'unknown'))
+                message = data.get('error')
         except ValueError:
             pass
-        return '{0}\nReason: {1}'.format(error, error.response.content.decode())
+
+        if not message:
+            message = 'Unexpected response from database: {0}'.format(response.content.decode())
+
+        return message
+
+
+class _EmulatorAdminCredentials(google.auth.credentials.Credentials):
+    def __init__(self):
+        google.auth.credentials.Credentials.__init__(self)
+        self.token = 'owner'
+
+    def refresh(self, request):
+        pass
